@@ -39,6 +39,22 @@ Orders API with `intent: AUTHORIZE`, Authorize, Capture and Void (PayPal **sandb
 ## How this was built
 I chose the idea, designed the hold-then-release flow, and tested every path. I used Claude as a coding assistant to write and explain the code while I learned it. Gemini and OpenRouter models power the AI judge inside the app.
 
+## Known limitations (this is a prototype)
+I built TrustHold to prove the core idea, and I found these limits while testing:
+
+- **Client can read the work, then cancel.** The client and freelancer share one screen, and the client sees the delivered work before deciding. A dishonest client could copy it and cancel the hold.
+- **The AI can be wrong.** It only recommends, and a human always decides. There is no dispute reviewer yet.
+- **No separate logins.** One person plays both roles in the demo.
+- **Authorization holds expire.** PayPal holds expire after a limited time, and there is no automatic release yet.
+- **Text only.** The work is pasted text, with no file uploads.
+
+## Roadmap
+1. Lock the delivered work until payment is released.
+2. Separate client and freelancer logins.
+3. A dispute step with a real reviewer when the client and AI disagree.
+4. Automatic release before the hold expires, when the AI says the work matches.
+5. File uploads and milestone payments.
+
 ## Demo video
 (add the YouTube link here)
 
