@@ -16,6 +16,11 @@ st.title("🔒 TrustHold")
 st.caption("Pay only when the work is proven. (PayPal sandbox, fake money)")
 deals = load()
 
+# CHANGED 1: shows the end of the Order ID, the amount and the start of the brief
+def label(k):
+    d = deals[k]
+    return f"Order {k[-6:]} | ${d['amount']:.0f} | {d['brief'][:35]}"
+
 # Client came back from PayPal after approving: hold the money
 token = st.query_params.get("token")
 if token in deals and deals[token]["status"] == "created":
@@ -33,12 +38,14 @@ with t1:
         order_id, link = create_order(amount, brief[:120], URL)
         deals[order_id] = {"brief": brief, "amount": amount, "status": "created"}
         save(deals)
+        st.success(f"Deal created. Order ID: {order_id}")  # CHANGED 2
         st.link_button("Approve on PayPal", link)
 
 with t2:
-    held = [k for k, v in deals.items() if v["status"] == "held"]
+    held = [k for k, v in deals.items() if v["status"] == "held"][::-1]  # CHANGED 3: newest first
     if held:
-        k = st.selectbox("Deal", held)
+        k = st.selectbox("Deal", held, format_func=label)  # CHANGED 3
+        st.caption(f"Order ID: {k}")  # CHANGED 3
         st.write(deals[k]["brief"])
         work = st.text_area("Paste your work")
         if st.button("Submit to AI judge") and work:
@@ -56,9 +63,10 @@ with t2:
         st.info("No held deals yet.")
 
 with t3:
-    review = [k for k, v in deals.items() if v["status"] == "reviewed"]
+    review = [k for k, v in deals.items() if v["status"] == "reviewed"][::-1]  # CHANGED 4: newest first
     if review:
-        k = st.selectbox("Deal to review", review)
+        k = st.selectbox("Deal to review", review, format_func=label)  # CHANGED 4
+        st.caption(f"Order ID: {k}")  # CHANGED 4
         d = deals[k]
         st.write("Brief:", d["brief"])
         st.code(d["work"])
