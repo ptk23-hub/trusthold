@@ -1,87 +1,165 @@
-import json, os
-import streamlit as st
-from paypal_helper import create_order, authorize_order, capture_payment, void_payment
-from ai_judge import judge_work
+import os
+import json
+import time
+import hashlib
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
-FILE = "deals.json"
-URL = "http://localhost:8501"
+load_dotenv()
+gemini = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-def load():
-    return json.load(open(FILE)) if os.path.exists(FILE) else {}
+GEMINI_MODEL = "gemini-3.8-flash"   # set to "" to skip Gemini and save its daily quota
+CACHE_FILE = "judge_cache.json"
 
-def save(d):
-    json.dump(d, open(FILE, "w"), indent=2)
 
-st.title("🔒 TrustHold")
-st.caption("Pay only when the work is proven. (PayPal sandbox, fake money)")
-deals = load()
+def load_cache():
+    try:
+        with open(CACHE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-# CHANGED 1: shows the end of the Order ID, the amount and the start of the brief
-def label(k):
-    d = deals[k]
-    return f"Order {k[-6:]} | ${d['amount']:.0f} | {d['brief'][:35]}"
 
-# Client came back from PayPal after approving: hold the money
-token = st.query_params.get("token")
-if token in deals and deals[token]["status"] == "created":
-    deals[token]["auth_id"] = authorize_order(token)
-    deals[token]["status"] = "held"
-    save(deals)
-    st.success("PayPal is now HOLDING the money. Go to tab 2.")
+def save_cache(cache):
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f)
 
-t1, t2, t3 = st.tabs(["1. Create deal", "2. Deliver work", "3. Decide"])
 
-with t1:
-    brief = st.text_area("Brief (what do you need?)")
-    amount = st.number_input("Amount (USD)", min_value=1.0, value=10.0)
-    if st.button("Create deal") and brief:
-        order_id, link = create_order(amount, brief[:120], URL)
-        deals[order_id] = {"brief": brief, "amount": amount, "status": "created"}
-        save(deals)
-        st.success(f"Deal created. Order ID: {order_id}")  # CHANGED 2
-        st.link_button("Approve on PayPal", link)
+def build_prompt(brief, work):
+    return f"""Compare the WORK with the BRIEF.
+BRIEF: {brief}
+WORK: {work}
 
-with t2:
-    held = [k for k, v in deals.items() if v["status"] == "held"][::-1]  # CHANGED 3: newest first
-    if held:
-        k = st.selectbox("Deal", held, format_func=label)  # CHANGED 3
-        st.caption(f"Order ID: {k}")  # CHANGED 3
-        st.write(deals[k]["brief"])
-        work = st.text_area("Paste your work")
-        if st.button("Submit to AI judge") and work:
-            try:
-                with st.spinner("AI judge is checking the work..."):
-                    verdict = judge_work(deals[k]["brief"], work)
-                deals[k]["work"] = work
-                deals[k]["verdict"] = verdict
-                deals[k]["status"] = "reviewed"
-                save(deals)
-                st.success("Submitted. Go to tab 3.")
-            except Exception as e:
-                st.warning(str(e))
-    else:
-        st.info("No held deals yet.")
+List the requirements from the brief (max 4). Each note: 6 words or fewer.
+"decision" is "release" only if all important requirements are met, else "cancel".
+"summary" is one short sentence.
+Reply ONLY with JSON:
+{{"checklist":[{{"requirement":"...","met":true,"note":"..."}}],"decision":"release","summary":"..."}}"""
 
-with t3:
-    review = [k for k, v in deals.items() if v["status"] == "reviewed"][::-1]  # CHANGED 4: newest first
-    if review:
-        k = st.selectbox("Deal to review", review, format_func=label)  # CHANGED 4
-        st.caption(f"Order ID: {k}")  # CHANGED 4
-        d = deals[k]
-        st.write("Brief:", d["brief"])
-        st.code(d["work"])
-        for i in d["verdict"]["checklist"]:
-            st.write("✅" if i["met"] else "❌", i["requirement"], "-", i["note"])
-        st.info(f"AI recommends: {d['verdict']['decision']}. {d['verdict']['summary']}")
-        if st.button("Release payment"):
-            capture_payment(d["auth_id"])
-            d["status"] = "paid"
-            save(deals)
-            st.success("Money RELEASED to the freelancer.")
-        if st.button("Cancel hold"):
-            void_payment(d["auth_id"])
-            d["status"] = "cancelled"
-            save(deals)
-            st.success("Hold CANCELLED. The client keeps their money.")
-    else:
-        st.info("Nothing to review yet.")
+
+def ask_gemini(prompt):
+    def call(config):
+        r = gemini.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
+        return json.loads(r.text)
+
+    base = dict(
+        response_mime_type="application/json",
+        temperature=0,
+        http_options=types.HttpOptions(timeout=10000),
+    )
+    try:
+        # thinking off = much faster
+        return call(types.GenerateContentConfig(
+            **base, thinking_config=types.ThinkingConfig(thinking_budget=0)))
+    except Exception as e:
+        if "400" in str(e) or "thinking" in str(e).lower():
+            return call(types.GenerateContentConfig(**base))
+        raise
+
+
+def ask_compat(prefix, prompt, model=None):
+    # OpenRouter (BACKUP) and any similar provider (FAST) use the same request format
+    r = requests.post(
+        os.getenv(f"{prefix}_BASE_URL") + "/chat/completions",
+        headers={"Authorization": f"Bearer {os.getenv(prefix + '_API_KEY')}"},
+        json={
+            "model": model or os.getenv(f"{prefix}_MODEL"),
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 400,
+        },
+        timeout=12,
+    )
+    r.raise_for_status()
+    text = r.json()["choices"][0]["message"].get("content")
+    if not text:
+        raise ValueError("empty reply")
+    s, e = text.find("{"), text.rfind("}")
+    if s == -1 or e == -1:
+        raise ValueError("no JSON in reply")
+    return json.loads(text[s:e + 1])
+
+
+def get_racers(prompt):
+    """Everything that is set up in .env becomes a racer."""
+    racers = []
+    if GEMINI_MODEL and os.getenv("GEMINI_API_KEY"):
+        racers.append(("Gemini", lambda: ask_gemini(prompt)))
+    if os.getenv("FAST_API_KEY") and os.getenv("FAST_BASE_URL") and os.getenv("FAST_MODEL"):
+        racers.append(("Fast AI", lambda: ask_compat("FAST", prompt)))
+    if os.getenv("BACKUP_API_KEY") and os.getenv("BACKUP_BASE_URL"):
+        for m in (os.getenv("BACKUP_MODEL") or "").split(","):
+            m = m.strip()
+            if m:
+                racers.append((f"OpenRouter {m.split('/')[-1][:22]}",
+                               lambda m=m: ask_compat("BACKUP", prompt, m)))
+    return racers
+
+
+def valid(res):
+    return (
+        isinstance(res, dict)
+        and res.get("decision") in ("release", "cancel")
+        and isinstance(res.get("checklist"), list)
+        and len(res["checklist"]) > 0
+    )
+
+
+def judge_work(brief, delivered_work):
+    # Same brief + same work = instant answer from the cache
+    key = hashlib.sha256((brief + "|" + delivered_work).encode()).hexdigest()
+    cache = load_cache()
+    if key in cache:
+        print("Answered from cache (instant)")
+        return cache[key]
+
+    prompt = build_prompt(brief, delivered_work)
+    racers = get_racers(prompt)
+    result = None
+    start = time.time()
+
+    if racers:
+        ex = ThreadPoolExecutor(max_workers=len(racers))
+        futures = {ex.submit(fn): name for name, fn in racers}
+        try:
+            for f in as_completed(futures, timeout=15):
+                name = futures[f]
+                try:
+                    res = f.result()
+                    if valid(res):
+                        result = res
+                        print(f"{name} won in {time.time() - start:.1f}s")
+                        break
+                    print(f"{name} gave an unusable answer")
+                except Exception as e:
+                    print(f"{name} failed:", str(e)[:80])
+        except Exception:
+            pass
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    if result is None:
+        raise RuntimeError(
+            "The AI judge is busy right now. Your money is still safely held. "
+            "Please try again in a minute."
+        )
+
+    cache[key] = result
+    save_cache(cache)
+    return result
+
+
+if __name__ == "__main__":
+    brief = "Write a 3-line slogan for a tea stall. Must mention 'chai' and be under 15 words per line."
+    work = "Fresh tea, fresh start.\nWarm cups, warm hearts.\nCome sip happiness today."
+
+    begin = time.time()
+    result = judge_work(brief, work)
+    for item in result["checklist"]:
+        mark = "YES" if item["met"] else "NO "
+        print(f"[{mark}] {item['requirement']} - {item['note']}")
+    print("\nDecision:", result["decision"])
+    print("Summary:", result["summary"])
+    print(f"Total: {time.time() - begin:.1f}s")
